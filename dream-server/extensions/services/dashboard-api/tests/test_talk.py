@@ -299,42 +299,76 @@ def test_talk_message_stream_cancels_upstream_on_client_disconnect(talk_client, 
     assert bridge_cancelled.is_set()
 
 
-def test_hermes_bridge_serializes_concurrent_submits_per_session(monkeypatch):
-    """Two concurrent stream_prompt calls with the same session_key must run
-    sequentially, not pile up on llama-server slots. Two calls with DIFFERENT
-    session_keys are allowed to overlap (different phones don't block each
-    other)."""
+def _run_with_one_loop(coro_factory):
+    """Tests that exercise the bridge run several coroutines on the SAME
+    event loop so the background sweeper task doesn't get orphaned across
+    loop swaps (which would surface as "Task was destroyed but it is
+    pending" warnings). Caller passes a *factory* — a 0-arg callable that
+    returns a coroutine — because coroutines themselves can't be re-awaited.
+    """
+    import asyncio as _asyncio
+    import hermes_bridge
+    loop = _asyncio.new_event_loop()
+    try:
+        result = loop.run_until_complete(coro_factory())
+        loop.run_until_complete(hermes_bridge.shutdown_pool())
+        return result
+    finally:
+        loop.close()
+
+
+def test_hermes_bridge_pool_serializes_same_key_parallels_different_keys(monkeypatch):
+    """Connection-pool contract:
+
+      * Two concurrent stream_prompt calls with the same session_key must run
+        sequentially (the per-connection lock pins the WS to one prompt at a
+        time — Hermes can't multiplex two prompt.submit on one session).
+      * Two calls with DIFFERENT session_keys are NOT blocked by each other;
+        they get separate pooled connections and run in parallel.
+
+    Stubs the WS + recv layer so we don't need a real Hermes. The pool's
+    behaviour is what's under test.
+    """
     import asyncio as _asyncio
     import hermes_bridge
 
-    hermes_bridge._SUBMIT_LOCKS.clear()
+    # Clear any pool state from prior tests. Synchronous reset since we
+    # haven't started a sweeper yet on this loop.
+    hermes_bridge._CONNECTION_POOL.clear()
+    hermes_bridge._SWEEPER_TASK = None
 
     enter_log: list[str] = []
     exit_log: list[str] = []
+    create_counts: dict[str, int] = {}
 
-    # Stub out the upstream so we don't need a real Hermes — the lock is what
-    # we're exercising. We patch the inner pieces stream_prompt calls.
-    async def fake_connect_ws(_session):
-        class FakeWS:
-            async def send_str(self, _): pass
-            async def __aenter__(self): return self
-            async def __aexit__(self, *a): pass
-        return FakeWS()
+    class FakeWS:
+        closed = False
+        async def send_str(self, _): pass
+        async def close(self): self.closed = True
 
-    async def fake_create(_ws, *, timeout=30):
-        return "sid-fake"
+    class FakeHTTP:
+        async def close(self): pass
 
-    monkeypatch.setattr("hermes_bridge._connect_ws", fake_connect_ws)
-    monkeypatch.setattr("hermes_bridge._create_session_on_ws", fake_create)
+    async def fake_open(session_key):
+        create_counts[session_key] = create_counts.get(session_key, 0) + 1
+        conn = hermes_bridge._HermesConnection(
+            http_session=FakeHTTP(),
+            ws=FakeWS(),
+            session_id=f"sid-{session_key}",
+        )
+        return conn
+
+    monkeypatch.setattr("hermes_bridge._open_connection", fake_open)
 
     async def fake_recv(_ws, _timeout):
-        # Sleep so the test observes ordering, then return a message.complete.
+        # Small delay so the test observes ordering, then deliver a
+        # message.complete that ends the stream.
         await _asyncio.sleep(0.1)
         return {
             "method": "event",
             "params": {
                 "type": "message.complete",
-                "session_id": "sid-fake",
+                "session_id": None,  # bridge accepts either matching or null
                 "payload": {"text": "done", "status": "ok"},
             },
         }
@@ -348,29 +382,292 @@ def test_hermes_bridge_serializes_concurrent_submits_per_session(monkeypatch):
         exit_log.append(tag)
 
     async def main():
-        # Two concurrent same-key callers — must serialize.
+        # Same-key serialization + pool reuse.
         await _asyncio.gather(drive("k1", "A"), drive("k1", "B"))
-        return list(enter_log), list(exit_log)
+        same_enter = list(enter_log)
+        same_exit = list(exit_log)
+        same_creates = dict(create_counts)
 
-    enter, exit_ = _asyncio.new_event_loop().run_until_complete(main())
-    # Both got past their initial enter print before any awaited stream
-    # work — that part isn't blocked. The interesting assertion is that
-    # B's exit fires AFTER A's exit (B waited for the lock).
-    assert enter == ["A", "B"]
-    assert exit_ == ["A", "B"], f"expected serialized exits A then B, got {exit_}"
+        # Reset for the different-key pass; keep same loop alive.
+        enter_log.clear()
+        exit_log.clear()
+        create_counts.clear()
+        await hermes_bridge.shutdown_pool()
+        hermes_bridge._CONNECTION_POOL.clear()
+        hermes_bridge._SWEEPER_TASK = None
 
-    # Now confirm different keys are NOT blocked by each other: kick off two
-    # with different keys; both finish near-simultaneously.
-    enter_log.clear()
-    exit_log.clear()
-    hermes_bridge._SUBMIT_LOCKS.clear()
-
-    async def main2():
         await _asyncio.gather(drive("phoneA", "A"), drive("phoneB", "B"))
+        diff_exit = set(exit_log)
+        diff_creates = dict(create_counts)
+        return same_enter, same_exit, same_creates, diff_exit, diff_creates
 
-    _asyncio.new_event_loop().run_until_complete(main2())
-    # Both complete; the order can be either A→B or B→A but both must finish.
-    assert set(exit_log) == {"A", "B"}
+    same_enter, same_exit, same_creates, diff_exit, diff_creates = _run_with_one_loop(main)
+    assert same_enter == ["A", "B"]
+    assert same_exit == ["A", "B"], f"same-key prompts must serialize, got {same_exit}"
+    assert same_creates["k1"] == 1, f"expected pool reuse for k1, got {same_creates['k1']} creates"
+    assert diff_exit == {"A", "B"}
+    assert diff_creates == {"phoneA": 1, "phoneB": 1}
+
+
+def test_hermes_bridge_transparent_retry_on_send_reset(monkeypatch):
+    """Most insidious dead-WS pattern: ``ws.closed`` reports False, but the
+    next ``send_str`` raises ClientConnectionResetError because the upstream
+    Hermes closed the socket between checks (e.g. a Hermes restart that
+    raced with the freshness check). The bridge must catch that, evict, and
+    transparently retry once on a fresh connection — the user shouldn't see
+    "load failed" just because Hermes restarted in the background."""
+    import aiohttp
+    import hermes_bridge
+
+    hermes_bridge._CONNECTION_POOL.clear()
+    hermes_bridge._SWEEPER_TASK = None
+
+    class DeadOnSendWS:
+        closed = False
+        async def send_str(self, _):
+            raise aiohttp.ClientConnectionResetError("Cannot write to closing transport")
+        async def close(self):
+            self.closed = True
+
+    class LiveWS:
+        closed = False
+        async def send_str(self, _): pass
+        async def close(self): self.closed = True
+
+    class FakeHTTP:
+        async def close(self): pass
+
+    open_calls = 0
+
+    async def fake_open(session_key):
+        nonlocal open_calls
+        open_calls += 1
+        # First connection has a WS that fails on send; second is healthy.
+        ws = DeadOnSendWS() if open_calls == 1 else LiveWS()
+        return hermes_bridge._HermesConnection(
+            http_session=FakeHTTP(), ws=ws, session_id=f"sid-{open_calls}",
+        )
+
+    monkeypatch.setattr("hermes_bridge._open_connection", fake_open)
+
+    async def fake_recv(_ws, _timeout):
+        return {"method": "event", "params": {"type": "message.complete", "payload": {"text": "ok"}}}
+    monkeypatch.setattr("hermes_bridge._recv_json", fake_recv)
+
+    async def main():
+        events = []
+        async for ev in hermes_bridge.stream_prompt("retry-key", "hi"):
+            events.append(ev["type"])
+            if ev["type"] == "complete":
+                break
+        return events, open_calls
+
+    events, opens = _run_with_one_loop(main)
+    # User got a clean stream: session frame + complete frame, no error.
+    assert "complete" in events, f"expected transparent retry to deliver complete, got {events}"
+    # Two connection opens: the dead one + the retry's fresh one.
+    assert opens == 2, f"expected 1 retry (opens == 2), got {opens}"
+
+
+def test_hermes_bridge_does_not_retry_after_prompt_submit(monkeypatch):
+    """A receive-side WS failure happens after prompt.submit was sent, so the
+    bridge must not retry the same prompt. Retrying there can duplicate tool
+    calls or append a second answer after partial streamed text. Only the
+    pre-submit send failure is safe to retry transparently."""
+    import hermes_bridge
+
+    hermes_bridge._CONNECTION_POOL.clear()
+    hermes_bridge._SWEEPER_TASK = None
+
+    class FakeWS:
+        closed = False
+        async def send_str(self, _): pass
+        async def close(self): self.closed = True
+
+    class FakeHTTP:
+        async def close(self): pass
+
+    open_calls = 0
+
+    async def fake_open(session_key):
+        nonlocal open_calls
+        open_calls += 1
+        return hermes_bridge._HermesConnection(
+            http_session=FakeHTTP(), ws=FakeWS(), session_id=f"sid-{open_calls}",
+        )
+
+    monkeypatch.setattr("hermes_bridge._open_connection", fake_open)
+
+    async def fake_recv(_ws, _timeout):
+        raise hermes_bridge.HermesUnavailable("closed after submit")
+
+    monkeypatch.setattr("hermes_bridge._recv_json", fake_recv)
+
+    async def main():
+        with pytest.raises(hermes_bridge.HermesUnavailable):
+            async for _event in hermes_bridge.stream_prompt("no-retry-key", "hi"):
+                pass
+        return open_calls, "no-retry-key" in hermes_bridge._CONNECTION_POOL
+
+    opens, still_pooled = _run_with_one_loop(main)
+    assert opens == 1, f"receive-side failure must not retry submitted prompt, got {opens} opens"
+    assert not still_pooled, "failed connection should be evicted before surfacing the error"
+
+
+def test_hermes_bridge_pool_evicts_and_recreates_on_dead_ws(monkeypatch):
+    """If the cached WS has closed (e.g. Hermes container restarted between
+    messages), the pool must evict it and open a fresh connection on the
+    next ``stream_prompt`` call rather than silently failing forever."""
+    import hermes_bridge
+
+    hermes_bridge._CONNECTION_POOL.clear()
+    hermes_bridge._SWEEPER_TASK = None
+
+    class FakeWS:
+        def __init__(self): self.closed = False
+        async def send_str(self, _): pass
+        async def close(self): self.closed = True
+
+    class FakeHTTP:
+        async def close(self): pass
+
+    create_count = 0
+
+    async def fake_open(session_key):
+        nonlocal create_count
+        create_count += 1
+        return hermes_bridge._HermesConnection(
+            http_session=FakeHTTP(),
+            ws=FakeWS(),
+            session_id=f"sid-{create_count}",
+        )
+
+    monkeypatch.setattr("hermes_bridge._open_connection", fake_open)
+
+    async def fake_recv(_ws, _timeout):
+        return {"method": "event", "params": {"type": "message.complete", "payload": {"text": "ok"}}}
+    monkeypatch.setattr("hermes_bridge._recv_json", fake_recv)
+
+    async def main():
+        # First call creates connection #1.
+        async for ev in hermes_bridge.stream_prompt("p1", "hi"):
+            if ev["type"] == "complete":
+                break
+        cached = hermes_bridge._CONNECTION_POOL["p1"]
+
+        # Simulate Hermes restart: mark the WS as closed.
+        cached.ws.closed = True
+
+        # Next call must NOT reuse the dead connection; must open a fresh one.
+        async for ev in hermes_bridge.stream_prompt("p1", "hi again"):
+            if ev["type"] == "complete":
+                break
+
+        return create_count, hermes_bridge._CONNECTION_POOL["p1"].session_id
+
+    creates, sid = _run_with_one_loop(main)
+    assert creates == 2, f"expected 2 connection opens (initial + after dead WS), got {creates}"
+    assert sid == "sid-2", f"pool should hold the new connection, has {sid}"
+
+
+def test_hermes_bridge_pool_sweeper_skips_active_connections(monkeypatch):
+    """A prompt can run longer than the idle timeout on a slow first turn.
+    The sweeper must not close a connection while its per-connection lock is
+    held, even if last_used is old."""
+    import asyncio as _asyncio
+    import hermes_bridge
+
+    hermes_bridge._CONNECTION_POOL.clear()
+    hermes_bridge._SWEEPER_TASK = None
+
+    monkeypatch.setattr("hermes_bridge._IDLE_EXPIRY_SECONDS", 0.05)
+    monkeypatch.setattr("hermes_bridge._IDLE_SWEEP_INTERVAL", 0.02)
+
+    closed_calls: list[str] = []
+
+    class FakeWS:
+        def __init__(self): self.closed = False
+        async def close(self): self.closed = True
+
+    class FakeHTTP:
+        async def close(self): pass
+
+    async def fake_open(session_key):
+        conn = hermes_bridge._HermesConnection(http_session=FakeHTTP(), ws=FakeWS(), session_id="sid")
+        original_close = conn.aclose
+        async def _tracked_close():
+            closed_calls.append(session_key)
+            await original_close()
+        conn.aclose = _tracked_close
+        return conn
+
+    monkeypatch.setattr("hermes_bridge._open_connection", fake_open)
+
+    async def main():
+        conn = await hermes_bridge._get_connection("active-key")
+        await conn.lock.acquire()
+        try:
+            conn.last_used -= 100
+            hermes_bridge._ensure_sweeper_running()
+            await _asyncio.sleep(0.15)
+            return "active-key" in hermes_bridge._CONNECTION_POOL, list(closed_calls)
+        finally:
+            conn.lock.release()
+
+    still_in_pool, closed = _run_with_one_loop(main)
+    assert still_in_pool, "active connection should not be swept while its lock is held"
+    assert closed == [], f"sweeper should not close active connection, got {closed}"
+
+
+def test_hermes_bridge_pool_sweeper_evicts_idle_connections(monkeypatch):
+    """Connections idle longer than _IDLE_EXPIRY_SECONDS must be closed
+    by the background sweeper so a fleet of one-time visitors doesn't
+    pin Hermes resources forever."""
+    import asyncio as _asyncio
+    import hermes_bridge
+
+    hermes_bridge._CONNECTION_POOL.clear()
+    hermes_bridge._SWEEPER_TASK = None
+
+    # Tight timings so the test is fast.
+    monkeypatch.setattr("hermes_bridge._IDLE_EXPIRY_SECONDS", 0.05)
+    monkeypatch.setattr("hermes_bridge._IDLE_SWEEP_INTERVAL", 0.02)
+
+    closed_calls: list[str] = []
+
+    class FakeWS:
+        def __init__(self): self.closed = False
+        async def close(self): self.closed = True
+
+    class FakeHTTP:
+        async def close(self): pass
+
+    async def fake_open(session_key):
+        ws = FakeWS()
+        conn = hermes_bridge._HermesConnection(http_session=FakeHTTP(), ws=ws, session_id="sid")
+        original_close = conn.aclose
+        async def _tracked_close():
+            closed_calls.append(session_key)
+            await original_close()
+        conn.aclose = _tracked_close
+        return conn
+
+    monkeypatch.setattr("hermes_bridge._open_connection", fake_open)
+
+    async def main():
+        # Plant a connection manually (skip stream_prompt, simpler).
+        conn = await hermes_bridge._get_connection("idle-key")
+        assert "idle-key" in hermes_bridge._CONNECTION_POOL
+        # Backdate last_used so it's clearly past expiry.
+        conn.last_used -= 100
+        hermes_bridge._ensure_sweeper_running()
+        # Wait long enough for the sweep loop to fire at least once.
+        await _asyncio.sleep(0.15)
+        return "idle-key" in hermes_bridge._CONNECTION_POOL, list(closed_calls)
+
+    still_in_pool, closed = _run_with_one_loop(main)
+    assert not still_in_pool, "sweeper should have evicted the idle connection"
+    assert "idle-key" in closed, f"sweeper should have called aclose(), got {closed}"
 
 
 def test_talk_message_stream_sets_unbuffered_headers(talk_client, monkeypatch):

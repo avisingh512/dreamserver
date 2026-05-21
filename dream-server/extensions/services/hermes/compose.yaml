@@ -25,6 +25,10 @@ services:
       # >60s to load a model under heavy use.
       - HERMES_API_TIMEOUT=1800
       - HERMES_API_CALL_STALE_TIMEOUT=900
+      # Default terminal-tool timeout. We disable the `terminal` toolset
+      # entirely via cli-config.yaml's `agent.disabled_toolsets`, but this is
+      # belt-and-suspenders if a future config refactor re-enables it.
+      - TERMINAL_TIMEOUT=30
       # Locale + timezone match the rest of the stack.
       - TZ=${TIMEZONE:-UTC}
       - HERMES_LANGUAGE=${HERMES_LANGUAGE:-en}
