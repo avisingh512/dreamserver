@@ -37,6 +37,24 @@ else
         ' "$env_file" > "$tmp_file" && cat "$tmp_file" > "$env_file" && rm -f "$tmp_file"
     }
 
+    _phase11_env_get() {
+        local key="$1" default="${2:-}" env_file="$INSTALL_DIR/.env"
+        if [[ -f "$env_file" ]]; then
+            local value
+            value=$(grep -m1 "^${key}=" "$env_file" 2>/dev/null | cut -d= -f2- || true)
+            [[ -n "$value" ]] && { echo "$value"; return 0; }
+        fi
+        echo "$default"
+    }
+
+    _phase11_external_lemonade() {
+        local external managed mode
+        external="${LEMONADE_EXTERNAL:-$(_phase11_env_get LEMONADE_EXTERNAL false)}"
+        managed="${AMD_INFERENCE_MANAGED:-$(_phase11_env_get AMD_INFERENCE_MANAGED "")}"
+        mode="${DREAM_MODE:-$(_phase11_env_get DREAM_MODE local)}"
+        [[ "${external,,}" == "true" ]] || [[ "${mode,,}" == "lemonade" && "${managed,,}" == "false" ]]
+    }
+
     _phase11_close_inherited_fds_for_daemon() {
         local fd fd_dir fd_name
 
@@ -86,19 +104,29 @@ else
         ai_ok "Rewrote .env for CPU fallback"
     }
 
-    _phase11_allow_host_agent_firewall() {
+    _phase11_allow_container_host_firewall() {
         local network_name="${1:-dream-network}"
-        local port="${DREAM_AGENT_PORT:-7710}"
-        local bind_addr="${DREAM_AGENT_BIND:-}"
+        local port="$2"
+        local rule_label="$3"
+        local bind_addr="${4:-}"
+        local service_label="${5:-$rule_label}"
         local subnet fw_rule
         local -a subnets=()
 
         [[ "$(uname -s 2>/dev/null || echo unknown)" == "Linux" ]] || return 0
         command -v systemctl >/dev/null 2>&1 || return 0
         command -v sudo >/dev/null 2>&1 || return 0
+        [[ "$port" =~ ^[0-9]+$ ]] || {
+            ai_warn "Skipping $service_label firewall rule; invalid port: ${port:-unset}"
+            return 0
+        }
 
         if [[ -n "$bind_addr" && "$bind_addr" != "0.0.0.0" ]]; then
-            ai_warn "DREAM_AGENT_BIND=$bind_addr; skipping automatic host-agent firewall rule."
+            if [[ "$rule_label" == "dream-host-agent" ]]; then
+                ai_warn "DREAM_AGENT_BIND=$bind_addr; skipping automatic host-agent firewall rule."
+            else
+                ai_warn "$service_label bind address is $bind_addr; skipping automatic firewall rule."
+            fi
             return 0
         fi
 
@@ -109,11 +137,11 @@ else
 
         if [[ ${#subnets[@]} -eq 0 ]]; then
             if command -v ufw >/dev/null 2>&1 && systemctl is-active --quiet ufw 2>/dev/null; then
-                ai_warn "UFW is active, but I could not detect the $network_name subnet for host-agent access."
-                ai_warn "If dashboard says host-agent is offline, inspect: docker network inspect $network_name"
+                ai_warn "UFW is active, but I could not detect the $network_name subnet for $service_label access."
+                ai_warn "Inspect: docker network inspect $network_name"
             elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
-                ai_warn "firewalld is active, but I could not detect the $network_name subnet for host-agent access."
-                ai_warn "If dashboard says host-agent is offline, inspect: docker network inspect $network_name"
+                ai_warn "firewalld is active, but I could not detect the $network_name subnet for $service_label access."
+                ai_warn "Inspect: docker network inspect $network_name"
             fi
             return 0
         fi
@@ -121,27 +149,62 @@ else
         for subnet in "${subnets[@]}"; do
             if command -v ufw >/dev/null 2>&1 && systemctl is-active --quiet ufw 2>/dev/null; then
                 if sudo ufw status 2>/dev/null | grep -F "${port}/tcp" | grep -F "$subnet" >/dev/null; then
-                    ai_ok "UFW already allows dream-host-agent (port $port) from $network_name subnet $subnet"
-                elif sudo ufw allow from "$subnet" to any port "$port" proto tcp comment 'dream-host-agent' 2>&1 | tee -a "$LOG_FILE" >/dev/null; then
-                    ai_ok "UFW: allowed dream-host-agent (port $port) from $network_name subnet $subnet"
+                    ai_ok "UFW already allows $service_label (port $port) from $network_name subnet $subnet"
+                elif sudo ufw allow from "$subnet" to any port "$port" proto tcp comment "$rule_label" 2>&1 | tee -a "$LOG_FILE" >/dev/null; then
+                    ai_ok "UFW: allowed $service_label (port $port) from $network_name subnet $subnet"
                 else
-                    ai_warn "UFW: failed to auto-add host-agent rule - run manually:"
-                    ai_warn "  sudo ufw allow from $subnet to any port $port proto tcp comment 'dream-host-agent'"
+                    ai_warn "UFW: failed to auto-add $service_label rule - run manually:"
+                    ai_warn "  sudo ufw allow from $subnet to any port $port proto tcp comment '$rule_label'"
                 fi
             elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
                 fw_rule="rule family=\"ipv4\" source address=\"$subnet\" port protocol=\"tcp\" port=\"$port\" accept"
                 if sudo firewall-cmd --query-rich-rule="$fw_rule" >/dev/null 2>&1; then
-                    ai_ok "firewalld already allows dream-host-agent (port $port) from $network_name subnet $subnet"
+                    ai_ok "firewalld already allows $service_label (port $port) from $network_name subnet $subnet"
                 elif sudo firewall-cmd --permanent --add-rich-rule="$fw_rule" 2>&1 | tee -a "$LOG_FILE" >/dev/null \
                   && sudo firewall-cmd --reload 2>&1 | tee -a "$LOG_FILE" >/dev/null; then
-                    ai_ok "firewalld: allowed dream-host-agent (port $port) from $network_name subnet $subnet"
+                    ai_ok "firewalld: allowed $service_label (port $port) from $network_name subnet $subnet"
                 else
-                    ai_warn "firewalld: failed to auto-add host-agent rule - run manually:"
+                    ai_warn "firewalld: failed to auto-add $service_label rule - run manually:"
                     ai_warn "  sudo firewall-cmd --permanent --add-rich-rule='$fw_rule'"
                     ai_warn "  sudo firewall-cmd --reload"
                 fi
             fi
         done
+    }
+
+    _phase11_allow_host_agent_firewall() {
+        _phase11_allow_container_host_firewall \
+            "${1:-dream-network}" \
+            "${DREAM_AGENT_PORT:-7710}" \
+            "dream-host-agent" \
+            "${DREAM_AGENT_BIND:-}" \
+            "dream-host-agent"
+    }
+
+    _phase11_allow_external_lemonade_firewall() {
+        _phase11_external_lemonade || return 0
+
+        local network_name="${1:-dream-network}"
+        local port base without_scheme host_port
+        port="${AMD_INFERENCE_PORT:-$(_phase11_env_get AMD_INFERENCE_PORT "")}"
+        base="${LEMONADE_BASE_URL:-$(_phase11_env_get LEMONADE_BASE_URL "http://localhost:13305")}"
+        base="${base%/}"
+        if [[ -z "$port" ]]; then
+            without_scheme="${base#*://}"
+            host_port="${without_scheme%%/*}"
+            if [[ "$host_port" == *:* ]]; then
+                port="${host_port##*:}"
+            else
+                port="13305"
+            fi
+        fi
+
+        _phase11_allow_container_host_firewall \
+            "$network_name" \
+            "$port" \
+            "dream-external-lemonade" \
+            "" \
+            "external Lemonade"
     }
 
     if [[ "${GPU_BACKEND:-}" == "amd" ]] && ! amd_gpu_runtime_devices_available; then
@@ -240,7 +303,8 @@ else
         return 1
     }
 
-    # Cloud mode: skip model downloads, auto-enable litellm
+    # Cloud/external Lemonade modes skip Dream-managed GGUF downloads and
+    # auto-enable LiteLLM because it is the routing surface for both paths.
     if [[ "${DREAM_MODE:-local}" == "cloud" ]]; then
         ai "Cloud mode — skipping model download"
         # Auto-enable litellm extension
@@ -249,6 +313,14 @@ else
         if [[ -f "$litellm_disabled" && ! -f "$litellm_cf" ]]; then
             mv "$litellm_disabled" "$litellm_cf"
             ai_ok "Auto-enabled litellm for cloud mode"
+        fi
+    elif _phase11_external_lemonade; then
+        ai "Existing Lemonade mode - skipping Dream-managed GGUF download"
+        litellm_cf="$INSTALL_DIR/extensions/services/litellm/compose.yaml"
+        litellm_disabled="${litellm_cf}.disabled"
+        if [[ -f "$litellm_disabled" && ! -f "$litellm_cf" ]]; then
+            mv "$litellm_disabled" "$litellm_cf"
+            ai_ok "Auto-enabled litellm for external Lemonade mode"
         fi
     fi
 
@@ -283,7 +355,7 @@ else
     # Download GGUF model if not already present (with retry and integrity verification)
     dream_progress 76 "services" "Checking AI model"
     GGUF_DIR="$INSTALL_DIR/data/models"
-    if [[ "${DREAM_MODE:-local}" != "cloud" && -n "$GGUF_URL" ]]; then
+    if [[ "${DREAM_MODE:-local}" != "cloud" && -n "$GGUF_URL" ]] && ! _phase11_external_lemonade; then
         # Check if model exists and verify integrity
         if [[ -f "$GGUF_DIR/$GGUF_FILE" ]]; then
             if [[ -n "$GGUF_SHA256" ]]; then
@@ -380,7 +452,7 @@ else
         fi
 
         # Abort if model download/verification failed
-        if [[ "${DREAM_MODE:-local}" != "cloud" && -n "$GGUF_URL" && ! -f "$GGUF_DIR/$GGUF_FILE" ]]; then
+        if [[ "${DREAM_MODE:-local}" != "cloud" && -n "$GGUF_URL" && ! -f "$GGUF_DIR/$GGUF_FILE" ]] && ! _phase11_external_lemonade; then
             ai_bad "Model file missing or verification failed. Cannot proceed without a valid model."
             ai "Re-run the installer to retry the download."
             exit 1
@@ -451,7 +523,7 @@ else
     fi
 
     # Generate models.ini for llama-server (skip in cloud mode)
-    if [[ "${DREAM_MODE:-local}" != "cloud" ]]; then
+    if [[ "${DREAM_MODE:-local}" != "cloud" ]] && ! _phase11_external_lemonade; then
         mkdir -p "$INSTALL_DIR/config/llama-server"
         cat > "$INSTALL_DIR/config/llama-server/models.ini" << MODELS_INI_EOF
 [${LLM_MODEL}]
@@ -541,10 +613,12 @@ MODELS_INI_EOF
             # prefixes GGUF files with "extra."; llama.cpp uses the file name.
             if [[ "${DREAM_MODE:-local}" == "cloud" ]]; then
                 _hermes_model="${LLM_MODEL:-default}"
+            elif _phase11_external_lemonade; then
+                _hermes_model="${LEMONADE_MODEL:-$(_phase11_env_get LEMONADE_MODEL "${LLM_MODEL:-default}")}"
             else
                 _hermes_model="$GGUF_FILE"
             fi
-            if [[ "${GPU_BACKEND:-}" == "amd" && "${DREAM_MODE:-local}" != "cloud" ]]; then
+            if [[ "${GPU_BACKEND:-}" == "amd" && "${DREAM_MODE:-local}" != "cloud" ]] && ! _phase11_external_lemonade; then
                 _hermes_model="extra.$GGUF_FILE"
             fi
             # base_url: on AMD/Lemonade hosts, route Hermes through litellm
@@ -561,7 +635,7 @@ MODELS_INI_EOF
             if [[ "${DREAM_MODE:-local}" == "cloud" ]]; then
                 _hermes_base_url="${HERMES_LLM_BASE_URL:-http://litellm:4000/v1}"
                 _hermes_api_key="${HERMES_LLM_API_KEY:-${LITELLM_KEY:-}}"
-            elif [[ "${GPU_BACKEND:-}" == "amd" ]]; then
+            elif [[ "${GPU_BACKEND:-}" == "amd" ]] || _phase11_external_lemonade; then
                 _hermes_base_url="http://litellm:4000/v1"
                 _hermes_api_key="${LITELLM_KEY:-}"
             fi
@@ -814,6 +888,7 @@ except Exception:
     # traffic. Add a scoped rule only after compose has created dream-network,
     # so we allow the actual Docker subnet instead of a broad RFC1918 range.
     _phase11_allow_host_agent_firewall dream-network
+    _phase11_allow_external_lemonade_firewall dream-network
 
     if $compose_ok; then
         if ! _phase11_assert_managed_containers; then
